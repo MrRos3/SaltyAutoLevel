@@ -17,7 +17,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 --
 -- When you upload this script to GitHub, replace this:
 --
-local SALTY_RAW_URL = "https://github.com/MrRos3/SaltyAutoLevel/edit/main/SaltyAutoLevel.lua"
+local SALTY_RAW_URL = "https://raw.githubusercontent.com/MrRos3/SaltyAutoLevel/refs/heads/main/SaltyAutoLevel.lua"
 
 -- Example:
 -- local SALTY_RAW_URL =

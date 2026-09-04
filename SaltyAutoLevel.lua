@@ -1,5 +1,5 @@
 --// Salty Auto Level
---// Instant Win -> Auto Retry -> Auto Re-Execute After Teleport
+--// Instant Win -> Auto Retry -> wait for REAL level load -> Auto Win
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -47,23 +47,29 @@ end
 
 _G.SaltyMiniRun = (_G.SaltyMiniRun or 0) + 1
 local RUN_ID = _G.SaltyMiniRun
+
 local function Running()
     return _G.SaltyMiniRun == RUN_ID
 end
 
 local oldGui = PlayerGui:FindFirstChild("SaltyMini")
-if oldGui then oldGui:Destroy() end
+if oldGui then
+    oldGui:Destroy()
+end
 
 if _G.SaltyMiniConnections then
-    for _, c in ipairs(_G.SaltyMiniConnections) do
-        pcall(function() c:Disconnect() end)
+    for _, connection in ipairs(_G.SaltyMiniConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
     end
 end
+
 _G.SaltyMiniConnections = {}
 
-local function Track(c)
-    table.insert(_G.SaltyMiniConnections, c)
-    return c
+local function Track(connection)
+    table.insert(_G.SaltyMiniConnections, connection)
+    return connection
 end
 
 --==================================================
@@ -74,15 +80,20 @@ local AutoInstantWin = true
 local AutoRetry = true
 local WinBusy = false
 local RetryBusy = false
+local WaitingForLevel = false
 local LastWin = 0
 local ScreenGui
 local StatusLabel
+local LevelWaitToken = 0
 
 local RETRY_SCAN_DELAY = 0.03
 local RETRY_CLICK_WAIT = 0.06
+local LEVEL_SCAN_DELAY = 0.05
 
 local function SetStatus(text)
-    if StatusLabel then StatusLabel.Text = text end
+    if StatusLabel then
+        StatusLabel.Text = text
+    end
     print("[Salty] " .. text)
 end
 
@@ -92,18 +103,26 @@ end
 
 local Character = LocalPlayer.Character
 local Humanoid
+local HumanoidRootPart
 
 local function RefreshCharacter()
     Character = LocalPlayer.Character
+
     if Character then
         Humanoid = Character:FindFirstChildOfClass("Humanoid")
+        HumanoidRootPart = Character:FindFirstChild("HumanoidRootPart")
+    else
+        Humanoid = nil
+        HumanoidRootPart = nil
     end
 end
 
 RefreshCharacter()
+
 Track(LocalPlayer.CharacterAdded:Connect(function(char)
     Character = char
     Humanoid = char:WaitForChild("Humanoid", 5)
+    HumanoidRootPart = char:WaitForChild("HumanoidRootPart", 5)
 end))
 
 --==================================================
@@ -113,10 +132,14 @@ end))
 local function GetRemote(path, timeout)
     timeout = timeout or 3
     local current = ReplicatedStorage
+
     for _, name in ipairs(path) do
         current = current:FindFirstChild(name) or current:WaitForChild(name, timeout)
-        if not current then return nil end
+        if not current then
+            return nil
+        end
     end
+
     return current
 end
 
@@ -134,22 +157,206 @@ end
 
 local function GetCurrentLevel()
     local current = GetLevelSettings()
-    if not current then return "Level0" end
+    if not current then
+        return "Level0"
+    end
 
     local childValue = current:FindFirstChild("Value")
-    if childValue then return childValue.Value end
-    if current:IsA("StringValue") then return current.Value end
+    if childValue then
+        return childValue.Value
+    end
+
+    if current:IsA("StringValue") then
+        return current.Value
+    end
 
     return "Level0"
+end
+
+--==================================================
+-- GUI VISIBILITY
+--==================================================
+
+local function IsVisible(object)
+    if not object then
+        return false
+    end
+
+    if object:IsA("GuiObject") and not object.Visible then
+        return false
+    end
+
+    local current = object.Parent
+
+    while current and current ~= PlayerGui do
+        if current:IsA("GuiObject") and not current.Visible then
+            return false
+        end
+
+        if current:IsA("ScreenGui") and not current.Enabled then
+            return false
+        end
+
+        current = current.Parent
+    end
+
+    return true
+end
+
+--==================================================
+-- RETRY DETECTION
+--==================================================
+
+local function IsRetryText(object)
+    if not (object:IsA("TextLabel") or object:IsA("TextButton")) then
+        return false
+    end
+
+    local text = tostring(object.Text or ""):lower():gsub("%s+", " ")
+    return text:find("retry level", 1, true) ~= nil
+end
+
+local function FindRetryText()
+    for _, object in ipairs(PlayerGui:GetDescendants()) do
+        if ScreenGui and object:IsDescendantOf(ScreenGui) then
+            continue
+        end
+
+        if IsRetryText(object) and IsVisible(object) then
+            return object
+        end
+    end
+
+    return nil
+end
+
+local function RetryVisible()
+    return FindRetryText() ~= nil
+end
+
+--==================================================
+-- REAL LEVEL LOADING DETECTION
+--==================================================
+
+local function GetVisibleLoadingPhase()
+    for _, object in ipairs(PlayerGui:GetDescendants()) do
+        if ScreenGui and object:IsDescendantOf(ScreenGui) then
+            continue
+        end
+
+        if (object:IsA("TextLabel") or object:IsA("TextButton")) and IsVisible(object) then
+            local text = tostring(object.Text or ""):lower():gsub("%s+", " ")
+
+            if text:find("loading assets", 1, true) then
+                return "LOADING ASSETS..."
+            end
+
+            if text:find("loading level", 1, true) then
+                return "LOADING LEVEL..."
+            end
+        end
+    end
+
+    return nil
+end
+
+local function CharacterReady()
+    RefreshCharacter()
+
+    return Character ~= nil
+        and Humanoid ~= nil
+        and Humanoid.Parent ~= nil
+        and HumanoidRootPart ~= nil
+        and HumanoidRootPart.Parent ~= nil
+        and Humanoid.Health > 0
+end
+
+-- Forward declaration because WaitForLevelReady calls it.
+local InstantComplete
+
+local function WaitForLevelReady(reason)
+    LevelWaitToken += 1
+    local myToken = LevelWaitToken
+
+    WaitingForLevel = true
+
+    task.spawn(function()
+        local startedAt = tick()
+        local sawLoadingPhase = false
+        local clearSince = nil
+        local lastPhase = nil
+
+        while Running()
+            and AutoInstantWin
+            and myToken == LevelWaitToken
+        do
+            local phase = GetVisibleLoadingPhase()
+
+            if phase then
+                sawLoadingPhase = true
+                clearSince = nil
+
+                if phase ~= lastPhase then
+                    lastPhase = phase
+                    SetStatus(phase)
+                end
+            else
+                local ready = CharacterReady() and not RetryVisible()
+
+                if ready then
+                    if not clearSince then
+                        clearSince = tick()
+                    end
+
+                    -- If we actually saw Loading Level / Loading Assets,
+                    -- fire shortly after those phases disappear.
+                    -- If the script was manually executed inside an already
+                    -- loaded level, use a longer fallback instead.
+                    local stableTime = sawLoadingPhase and 0.65 or 2.0
+                    local canFallback = sawLoadingPhase or (tick() - startedAt >= 4.0)
+
+                    if canFallback and tick() - clearSince >= stableTime then
+                        WaitingForLevel = false
+                        SetStatus("LEVEL READY")
+
+                        task.wait(0.15)
+
+                        if Running()
+                            and AutoInstantWin
+                            and myToken == LevelWaitToken
+                            and not RetryVisible()
+                        then
+                            InstantComplete()
+                        end
+
+                        return
+                    end
+                else
+                    clearSince = nil
+                end
+            end
+
+            task.wait(LEVEL_SCAN_DELAY)
+        end
+
+        if myToken == LevelWaitToken then
+            WaitingForLevel = false
+        end
+    end)
 end
 
 --==================================================
 -- INSTANT COMPLETE
 --==================================================
 
-local function InstantComplete()
-    if not Running() or WinBusy then return end
-    if tick() - LastWin < 1 then return end
+InstantComplete = function()
+    if not Running() or WinBusy or WaitingForLevel then
+        return
+    end
+
+    if tick() - LastWin < 1 then
+        return
+    end
 
     local qe = GetQuickEvent()
     if not qe then
@@ -172,44 +379,74 @@ local function InstantComplete()
 
     if Character then
         local state = Character:FindFirstChild("State")
-        if state then pcall(function() state.Value = "" end) end
+        if state then
+            pcall(function()
+                state.Value = ""
+            end)
+        end
 
         local spectating = Character:FindFirstChild("Spectating")
-        if spectating then pcall(function() spectating.Value = nil end) end
+        if spectating then
+            pcall(function()
+                spectating.Value = nil
+            end)
+        end
 
         local action = Character:FindFirstChild("Action")
-        if action then pcall(function() action.Value = "" end) end
+        if action then
+            pcall(function()
+                action.Value = ""
+            end)
+        end
     end
 
-    pcall(function() qe:FireServer("MakePlayerAliveClient") end)
+    pcall(function()
+        qe:FireServer("MakePlayerAliveClient")
+    end)
+
     task.wait(0.35)
 
-    pcall(function() qe:FireServer("MakePlayerPlayable") end)
+    pcall(function()
+        qe:FireServer("MakePlayerPlayable")
+    end)
+
     task.wait(0.35)
 
-    pcall(function() qe:FireServer("IsNotBusy", false) end)
+    pcall(function()
+        qe:FireServer("IsNotBusy", false)
+    end)
 
     local loadingGui = PlayerGui:FindFirstChild("LoadingScreen")
     if loadingGui then
         local black = loadingGui:FindFirstChild("BlackScreen")
+
         if black then
             pcall(function()
                 black.BackgroundTransparency = 1
                 black.Visible = false
             end)
         end
-        pcall(function() loadingGui.Enabled = false end)
+
+        pcall(function()
+            loadingGui.Enabled = false
+        end)
     end
 
     local lobbyScreen = PlayerGui:FindFirstChild("LobbyScreen")
     if lobbyScreen then
-        pcall(function() lobbyScreen.Enabled = true end)
+        pcall(function()
+            lobbyScreen.Enabled = true
+        end)
     end
 
     local firstPerson = PlayerGui:FindFirstChild("FirstPerson")
     if firstPerson then
         local mouseLock = firstPerson:FindFirstChild("MouseLock")
-        if mouseLock then pcall(function() mouseLock.Modal = true end) end
+        if mouseLock then
+            pcall(function()
+                mouseLock.Modal = true
+            end)
+        end
     end
 
     if Humanoid then
@@ -222,31 +459,43 @@ local function InstantComplete()
     if Character then
         local neck = Character:FindFirstChild("Neck", true)
         if neck and neck:IsA("Motor6D") then
-            pcall(function() neck.C0 = CFrame.new(0, neck.C0.Y, 0) end)
+            pcall(function()
+                neck.C0 = CFrame.new(0, neck.C0.Y, 0)
+            end)
         end
 
-        local rua = Character:FindFirstChild("RightUpperArm")
-        if rua then
-            local rs = rua:FindFirstChild("RightShoulder")
-            if rs and rs:IsA("Motor6D") then
-                pcall(function() rs.C0 = CFrame.new(0.701, 0.901, 0.007) end)
+        local rightUpperArm = Character:FindFirstChild("RightUpperArm")
+        if rightUpperArm then
+            local rightShoulder = rightUpperArm:FindFirstChild("RightShoulder")
+            if rightShoulder and rightShoulder:IsA("Motor6D") then
+                pcall(function()
+                    rightShoulder.C0 = CFrame.new(0.701, 0.901, 0.007)
+                end)
             end
         end
 
-        local lua = Character:FindFirstChild("LeftUpperArm")
-        if lua then
-            local ls = lua:FindFirstChild("LeftShoulder")
-            if ls and ls:IsA("Motor6D") then
-                pcall(function() ls.C0 = CFrame.new(-0.73, 0.879, 0.007) end)
+        local leftUpperArm = Character:FindFirstChild("LeftUpperArm")
+        if leftUpperArm then
+            local leftShoulder = leftUpperArm:FindFirstChild("LeftShoulder")
+            if leftShoulder and leftShoulder:IsA("Motor6D") then
+                pcall(function()
+                    leftShoulder.C0 = CFrame.new(-0.73, 0.879, 0.007)
+                end)
             end
         end
     end
 
     local l0e = GetLevel0Event()
     if l0e then
-        pcall(function() l0e:FireServer("EndedLastCutScene") end)
+        pcall(function()
+            l0e:FireServer("EndedLastCutScene")
+        end)
+
         task.wait(0.05)
-        pcall(function() l0e:FireServer("BlackScreenEnded") end)
+
+        pcall(function()
+            l0e:FireServer("BlackScreenEnded")
+        end)
     end
 
     WinBusy = false
@@ -254,50 +503,32 @@ local function InstantComplete()
 end
 
 --==================================================
--- RETRY DETECTION
+-- RETRY CLICKING
 --==================================================
 
-local function IsVisible(object)
-    if not object then return false end
-    if object:IsA("GuiObject") and not object.Visible then return false end
-
-    local current = object.Parent
-    while current and current ~= PlayerGui do
-        if current:IsA("GuiObject") and not current.Visible then return false end
-        if current:IsA("ScreenGui") and not current.Enabled then return false end
-        current = current.Parent
-    end
-    return true
-end
-
-local function IsRetryText(object)
-    if not (object:IsA("TextLabel") or object:IsA("TextButton")) then return false end
-    local text = tostring(object.Text or ""):lower():gsub("%s+", " ")
-    return text:find("retry level", 1, true) ~= nil
-end
-
-local function FindRetryText()
-    for _, object in ipairs(PlayerGui:GetDescendants()) do
-        if ScreenGui and object:IsDescendantOf(ScreenGui) then continue end
-        if IsRetryText(object) and IsVisible(object) then return object end
-    end
-    return nil
-end
-
-local function RetryVisible()
-    return FindRetryText() ~= nil
-end
-
 local function FindRetryButton(textObject)
-    if not textObject then return nil end
-    if textObject:IsA("GuiButton") then return textObject end
+    if not textObject then
+        return nil
+    end
+
+    if textObject:IsA("GuiButton") then
+        return textObject
+    end
 
     local current = textObject.Parent
+
     for _ = 1, 10 do
-        if not current or current == PlayerGui then break end
-        if current:IsA("GuiButton") then return current end
+        if not current or current == PlayerGui then
+            break
+        end
+
+        if current:IsA("GuiButton") then
+            return current
+        end
+
         current = current.Parent
     end
+
     return nil
 end
 
@@ -310,10 +541,10 @@ local function SilentClick(x, y)
 end
 
 local function GetClickPositions(object)
-    local p = object.AbsolutePosition
-    local s = object.AbsoluteSize
-    local x = p.X + s.X / 2
-    local y = p.Y + s.Y / 2
+    local position = object.AbsolutePosition
+    local size = object.AbsoluteSize
+    local x = position.X + size.X / 2
+    local y = position.Y + size.Y / 2
     local inset = GuiService:GetGuiInset()
 
     return {
@@ -324,34 +555,52 @@ local function GetClickPositions(object)
 end
 
 local function RetryLevel(textObject)
-    if RetryBusy or not AutoRetry then return end
+    if RetryBusy or not AutoRetry then
+        return
+    end
+
     RetryBusy = true
     SetStatus("RETRYING...")
 
     local button = FindRetryButton(textObject)
 
     if button and firesignal then
-        pcall(function() firesignal(button.Activated) end)
+        pcall(function()
+            firesignal(button.Activated)
+        end)
+
         task.wait(0.04)
+
         if RetryVisible() then
-            pcall(function() firesignal(button.MouseButton1Click) end)
+            pcall(function()
+                firesignal(button.MouseButton1Click)
+            end)
             task.wait(0.04)
         end
     end
 
     if RetryVisible() then
         local target = button or textObject
+
         for _, point in ipairs(GetClickPositions(target)) do
-            if not AutoRetry or not RetryVisible() then break end
+            if not AutoRetry or not RetryVisible() then
+                break
+            end
+
             SilentClick(point.X, point.Y)
             task.wait(RETRY_CLICK_WAIT)
         end
     end
 
     local success = false
+
     for _ = 1, 100 do
-        if not Running() then return end
+        if not Running() then
+            return
+        end
+
         task.wait(0.02)
+
         if not RetryVisible() then
             success = true
             break
@@ -360,23 +609,29 @@ local function RetryLevel(textObject)
 
     if success then
         SetStatus("RETRY SUCCESS")
-        task.delay(0.8, function()
-            if Running() and AutoInstantWin and not RetryVisible() then
-                InstantComplete()
-            end
-        end)
-    else
-        SetStatus("RETRY FAILED")
+        RetryBusy = false
+
+        -- Critical fix: do NOT instant-win on a blind timer.
+        -- Wait through Loading Level -> Loading Assets -> actual level.
+        WaitForLevelReady("RETRY")
+        return
     end
 
+    SetStatus("RETRY FAILED")
     RetryBusy = false
 end
 
 task.spawn(function()
     while Running() do
         task.wait(RETRY_SCAN_DELAY)
-        if AutoRetry and not RetryBusy and not WinBusy then
+
+        if AutoRetry
+            and not RetryBusy
+            and not WinBusy
+            and not WaitingForLevel
+        then
             local retryText = FindRetryText()
+
             if retryText then
                 task.spawn(RetryLevel, retryText)
             end
@@ -446,57 +701,59 @@ StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
 StatusLabel.Parent = Main
 
 local function CreateToggle(text, y, default, callback)
-    local Button = Instance.new("TextButton")
-    Button.Size = UDim2.new(1, -20, 0, 34)
-    Button.Position = UDim2.fromOffset(10, y)
-    Button.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
-    Button.BorderSizePixel = 0
-    Button.Text = ""
-    Button.AutoButtonColor = false
-    Button.Parent = Main
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(1, -20, 0, 34)
+    button.Position = UDim2.fromOffset(10, y)
+    button.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+    button.BorderSizePixel = 0
+    button.Text = ""
+    button.AutoButtonColor = false
+    button.Parent = Main
 
-    local BC = Instance.new("UICorner")
-    BC.CornerRadius = UDim.new(0, 8)
-    BC.Parent = Button
+    local buttonCorner = Instance.new("UICorner")
+    buttonCorner.CornerRadius = UDim.new(0, 8)
+    buttonCorner.Parent = button
 
-    local Label = Instance.new("TextLabel")
-    Label.Size = UDim2.new(1, -55, 1, 0)
-    Label.Position = UDim2.fromOffset(9, 0)
-    Label.BackgroundTransparency = 1
-    Label.Text = text
-    Label.TextColor3 = Color3.fromRGB(225, 225, 230)
-    Label.TextSize = 11
-    Label.Font = Enum.Font.GothamMedium
-    Label.TextXAlignment = Enum.TextXAlignment.Left
-    Label.Parent = Button
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -55, 1, 0)
+    label.Position = UDim2.fromOffset(9, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(225, 225, 230)
+    label.TextSize = 11
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = button
 
-    local State = Instance.new("TextLabel")
-    State.Size = UDim2.fromOffset(38, 21)
-    State.Position = UDim2.new(1, -45, 0.5, -10)
-    State.BorderSizePixel = 0
-    State.TextSize = 9
-    State.Font = Enum.Font.GothamBold
-    State.Parent = Button
+    local state = Instance.new("TextLabel")
+    state.Size = UDim2.fromOffset(38, 21)
+    state.Position = UDim2.new(1, -45, 0.5, -10)
+    state.BorderSizePixel = 0
+    state.TextSize = 9
+    state.Font = Enum.Font.GothamBold
+    state.Parent = button
 
-    local SC = Instance.new("UICorner")
-    SC.CornerRadius = UDim.new(1, 0)
-    SC.Parent = State
+    local stateCorner = Instance.new("UICorner")
+    stateCorner.CornerRadius = UDim.new(1, 0)
+    stateCorner.Parent = state
 
     local value = default
+
     local function Refresh()
         if value then
-            State.Text = "ON"
-            State.BackgroundColor3 = Color3.fromRGB(32, 54, 39)
-            State.TextColor3 = Color3.fromRGB(120, 255, 155)
+            state.Text = "ON"
+            state.BackgroundColor3 = Color3.fromRGB(32, 54, 39)
+            state.TextColor3 = Color3.fromRGB(120, 255, 155)
         else
-            State.Text = "OFF"
-            State.BackgroundColor3 = Color3.fromRGB(54, 37, 40)
-            State.TextColor3 = Color3.fromRGB(255, 125, 135)
+            state.Text = "OFF"
+            state.BackgroundColor3 = Color3.fromRGB(54, 37, 40)
+            state.TextColor3 = Color3.fromRGB(255, 125, 135)
         end
     end
 
     Refresh()
-    Button.MouseButton1Click:Connect(function()
+
+    button.MouseButton1Click:Connect(function()
         value = not value
         Refresh()
         callback(value)
@@ -505,12 +762,27 @@ end
 
 CreateToggle("Auto Instant Win", 65, true, function(value)
     AutoInstantWin = value
-    if value then task.spawn(InstantComplete) end
+
+    if value then
+        if WaitingForLevel then
+            return
+        end
+
+        task.spawn(function()
+            WaitForLevelReady("TOGGLE")
+        end)
+    else
+        LevelWaitToken += 1
+        WaitingForLevel = false
+    end
 end)
 
 CreateToggle("Auto Retry", 104, true, function(value)
     AutoRetry = value
-    if not value then RetryBusy = false end
+
+    if not value then
+        RetryBusy = false
+    end
 end)
 
 local WinButton = Instance.new("TextButton")
@@ -525,9 +797,9 @@ WinButton.Font = Enum.Font.GothamBold
 WinButton.AutoButtonColor = false
 WinButton.Parent = Main
 
-local WC = Instance.new("UICorner")
-WC.CornerRadius = UDim.new(0, 8)
-WC.Parent = WinButton
+local WinCorner = Instance.new("UICorner")
+WinCorner.CornerRadius = UDim.new(0, 8)
+WinCorner.Parent = WinButton
 
 WinButton.MouseButton1Click:Connect(function()
     task.spawn(InstantComplete)
@@ -543,7 +815,8 @@ local StartPosition
 
 Main.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
         Dragging = true
         DragStart = input.Position
         StartPosition = Main.Position
@@ -552,16 +825,22 @@ end)
 
 Main.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
         Dragging = false
     end
 end)
 
 Track(UserInputService.InputChanged:Connect(function(input)
-    if not Dragging then return end
+    if not Dragging then
+        return
+    end
+
     if input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch then
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
         local delta = input.Position - DragStart
+
         Main.Position = UDim2.new(
             StartPosition.X.Scale,
             StartPosition.X.Offset + delta.X,
@@ -575,10 +854,8 @@ end))
 -- AUTO START
 --==================================================
 
-task.delay(1, function()
-    if Running() and AutoInstantWin then
-        InstantComplete()
-    end
-end)
+SetStatus("WAITING LEVEL...")
 
-SetStatus("READY")
+-- Do not instant-win just because game:IsLoaded().
+-- The game still has its own Loading Level / Loading Assets phases.
+WaitForLevelReady("AUTO START")
